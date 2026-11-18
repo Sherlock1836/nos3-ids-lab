@@ -1,0 +1,16 @@
+diff --git a/cfg/nos3_defs/cpu1_cfe_es_startup.scr b/cfg/nos3_defs/cpu1_cfe_es_startup.scr
+index 70b53c6..44e4e55 100644
+--- a/cfg/nos3_defs/cpu1_cfe_es_startup.scr
++++ b/cfg/nos3_defs/cpu1_cfe_es_startup.scr
+@@ -10,2 +10,3 @@ CFE_APP, ci_lab,                    CI_Lab_AppMain,           CI_LAB_APP,
+ CFE_APP, to_lab,                    TO_LAB_AppMain,           TO_LAB_APP,       81, 32768, 0x0, 0;
++CFE_APP, ids_app,                   IDS_AppMain,              IDS_APP,          90, 32768, 0x0, 0;
+ 
+diff --git a/cfg/nos3_defs/targets.cmake b/cfg/nos3_defs/targets.cmake
+index ab95b48..5bedecb 100644
+--- a/cfg/nos3_defs/targets.cmake
++++ b/cfg/nos3_defs/targets.cmake
+@@ -96,2 +96,3 @@ list(APPEND MISSION_GLOBAL_APPLIST
+         ci_lab
++        ids_app
+         ds
