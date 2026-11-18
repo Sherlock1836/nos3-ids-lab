@@ -6,10 +6,56 @@ import csv
 from pathlib import Path
 
 
+def summarize_nominal(parser, audit, feature_path):
+    """Associate features with a same-session audit for known nominal traffic."""
+    with feature_path.open(newline="", encoding="utf-8-sig") as stream:
+        reader = csv.DictReader(stream)
+        columns = ["seq_delta", "delta_t_ms", "packet_size", "function_code", "packets_last_second"]
+        if reader.fieldnames != columns:
+            parser.error(f"expected feature header {','.join(columns)}")
+        features = list(reader)
+
+    if len({row["message_id"] for row in audit}) != 1:
+        parser.error("nominal feature analysis requires a single MID")
+    # An empty note is a scored pass. Warm-up and header errors have separate notes.
+    scored = [row for row in audit if not row["note"] or row["note"].startswith("Isolation Forest score ")]
+    if len(scored) != len(features):
+        parser.error("audit and feature counts disagree. Export both from the same capture")
+
+    prior_ms = None
+    packets = iter(features)
+    failures = []
+    for row in audit:
+        try:
+            current_ms = round(float(row["timestamp"]) * 1000)
+            note = row["note"]
+            if note.startswith("Warm-up"):
+                prior_ms = current_ms
+                continue
+            if note and not note.startswith("Isolation Forest score "):
+                continue
+            values = next(packets)
+            gap = int(values["delta_t_ms"])
+            count = int(values["packets_last_second"])
+            if prior_ms is not None and current_ms - prior_ms != gap:
+                parser.error("audit timestamps and feature gaps disagree. Check capture order")
+            prior_ms = current_ms
+        except (TypeError, ValueError, OverflowError):
+            parser.error("nominal captures require numeric timestamps, gaps, and window counts")
+        if row["status"] == "FAIL":
+            failures.append((row["timestamp"], gap, count))
+
+    print(f"Nominal model flags: {len(failures)}/{len(scored)} scored")
+    print(f"Other observations excluded from model rate: {len(audit) - len(scored)}")
+    for timestamp, gap, count in failures:
+        print(f"  MET {timestamp} s | gap {gap} ms | {count} packets in the last second")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("audit", type=Path)
     parser.add_argument("--plot", type=Path)
+    parser.add_argument("--nominal-features", type=Path, help="Feature CSV from the same known nominal capture")
     args = parser.parse_args()
     with args.audit.open(newline="", encoding="utf-8-sig") as stream:
         reader = csv.DictReader(stream)
@@ -29,6 +75,9 @@ def main():
     for mid in mids:
         passed, failed = counts[mid, "PASS"], counts[mid, "FAIL"]
         print(f"{mid:8} {passed:5}   {failed:5}   {failed / (passed + failed):7.1%}")
+
+    if args.nominal_features:
+        summarize_nominal(parser, rows, args.nominal_features)
 
     if args.plot:
         from matplotlib import pyplot as plt
