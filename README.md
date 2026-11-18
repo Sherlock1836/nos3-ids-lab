@@ -1,59 +1,57 @@
-# NOS3 command anomaly monitor
+# NOS3 command intrusion detector
 
-This workspace runs a passive cFS app in NASA NOS3's headless DeepSpace scenario. The app observes the Sample command MID `0x18FA` on the Software Bus. The lab runs cFS, NOS Engine, the NOS time driver, 42 dynamics, and the Sample simulator in the local `nos3-ids-lab` Docker container. Sample commands enter via CI_LAB on container loopback. The headless launcher disables the unused TO_LAB and radio IPC endpoints. It publishes no host ports.
+This branch runs a passive cFS IDS in NASA NOS3's headless DeepSpace scenario. It monitors the Sample (`0x18FA`) and CI_LAB (`0x18E0`) command MIDs on the Software Bus. The Docker lab runs cFS, NOS Engine, the NOS time driver, 42 dynamics, and the Sample simulator. The lab sends documented NOOPs through CI_LAB on container loopback and publishes no host ports.
 
-## Review of the transcript
+## What the detector evaluates
 
-- **The basic design is appropriate for a prototype.** Passive Software Bus observation, offline training, compiled inference, and an operator audit trail make a reasonable first milestone. A Software Bus subscription sees copies of selected messages. Subsystem apps can execute independently of when the IDS scores them. Link authentication, command authorization, prevention, and recovery require separate controls. See the [cFE Application Developer’s Guide](https://github.com/nasa/cFE/blob/dev/docs/cFE%20Application%20Developers%20Guide.md).
-- **The supplied feature code would teach the model artifacts.** The “window rate” grows for the lifetime of the process, the first observation gets invented timing values, and the sequence wrap correction covers only one direction. The implementation uses a capped one-second rolling count, signed 14-bit sequence deltas, and a warm-up record before scoring. Time is cFS mission elapsed time at IDS receipt. It reflects scheduling and queueing inside the sim.
-- **The original scoring logic and threshold need correction.** The initial stub is additive hand-written rules. With a threshold of 0.75, neither individual rule can flag a packet, and the sequence rule misses a zero delta. The trained model uses 16 isolation trees, full-precision split thresholds, and a threshold calibrated on a time-ordered nominal split. A failure note reports the score and threshold. The score is an outlier measure and cannot identify intent or establish an attack's cause. See [scikit-learn IsolationForest](https://scikit-learn.org/stable/modules/generated/sklearn.ensemble.IsolationForest.html).
-- **The transcript is missing a usable route from capture to validation.** The four-column audit CSV is for inspection. The separate feature CSV contains the actual inputs required for training. The trainer uses 60% of rows to fit, 20% to calibrate, and 20% to report a nominal holdout result. Capture curated nominal sessions in time order before training. A baseline of NOOP commands can exercise timing and queue behavior. Mission validation needs representative command types, resets, batching, and link conditions. A feature held constant in training cannot produce a tree split.
-- **The flight budget is still a mission requirement.** The C99 inference has no dynamic allocation and each log stops at 8,192 rows with an EVS event. Each boot starts fresh CSVs. Synchronous I/O and finite Software Bus queues can affect coverage during bursts. Docker Desktop denied the simulator's real-time scheduling request, and cFS ran with standard scheduling. Measure real-time cost and detection performance against the mission configuration and processor.
+- **Command contract.** The cFS app checks the header, function code, declared size, and cFS checksum. The contracts use the destination apps' command definitions. Configure the subscriptions and tables in `ids_app/fsw/src/ids_app.c` for a different mission. [cFE Application Developer’s Guide](https://github.com/nasa/cFE/blob/dev/docs/cFE%20Application%20Developers%20Guide.md)
+- **Temporal behavior.** Each MID has an independent one-second window and a 12-tree Isolation Forest exported to C99. A high score triggers an alert when a short gap and elevated recent command count corroborate it. A separate rate ceiling catches sustained high receiver counts. Five seconds of idleness or a clock regression causes warm-up. Timing is sampled at IDS receipt and includes receiver scheduling and queueing.
+- **Operator evidence.** The audit keeps the original four fields `timestamp,message_id,status,note`. A separate feature log includes MID, timestamp, raw features, score, and timing decision. A warm-up note identifies commands that passed the contract while the model gathered history.
 
-## Run it on this machine
+The app observes Software Bus copies and has no command authority. The checksum detects corruption and provides no sender authentication. Coverage is limited to the configured MIDs. The NOOP profiles need retraining on representative command mixes and mission modes. The C99 inference allocates no dynamic memory. Logs stop at 8,192 rows with an EVS event. Validate processor cost, queue loss, and alert rates on the target platform.
 
-Open PowerShell in this workspace with Docker Desktop running. Check the current session or start it after a stop.
+See [improved detector validation](docs/improved-detector.md) for this branch's results and [nominal validation of the first prototype](docs/nominal-validation.md) for the earlier experiment.
+
+## Run the lab
+
+After completing Local setup, launch the simulator or resume a previously built container.
 
 ```powershell
-docker ps --filter name=nos3-ids-lab
 docker start nos3-ids-lab
 docker exec -d nos3-ids-lab bash -lc 'bash /source/tools/start_lab.sh >/out/nos3-supervisor.log 2>&1'
-Select-String 'IDS watching MID' out/nos3-flight.log
+Select-String 'IDS watching MID|OPERATIONAL' out/nos3-flight.log
 ```
 
-Send a few normal Sample NOOPs inside the container. Use the next sequence number if sending several batches within the same session. Wait for the IDS startup event before sending.
+Once cFS reaches the operational state, capture a paced NOOP run and inspect its audit. Use an unused capture name and the next sequence number when continuing an earlier batch.
 
 ```powershell
-docker exec nos3-ids-lab python3 /source/tools/sample_noop.py --count 5 --sequence 0
-docker exec nos3-ids-lab bash /source/tools/export_audit.sh
-.\.venv\Scripts\python.exe tools/analyze_audit.py out/ids_live_audit.csv --plot out/ids_live_timeline.png
+docker exec nos3-ids-lab python3 /source/tools/capture_nominal.py smoke --count 5 --seed 42
+.\.venv\Scripts\python.exe tools/analyze_audit.py out/smoke_audit.csv --nominal-features out/smoke_features.csv --plot out/smoke_timeline.png
 ```
 
-The app writes `/ram/ids_audit_log.csv` and `/ram/ids_features.csv`. The export command copies snapshots into `out` on Windows. Export before restarting or stopping the container because the live files are in Linux shared memory. The audit columns are `timestamp,message_id,status,note`. Initial warm-up has an explicit header-only note. Stop the lab with `docker stop nos3-ids-lab`.
+The app writes `/ram/ids_audit_log.csv` and `/ram/ids_features.csv`. To save all current rows to the Windows workspace, run `docker exec nos3-ids-lab bash /source/tools/export_audit.sh`. Export before restarting or stopping the container because the live files are in Linux shared memory. Stop the lab with `docker stop nos3-ids-lab`.
 
-## Verified locally
+## Retrain and verify
 
-- **Live baseline.** 241 valid Sample NOOPs traversed CI_LAB and generated 241 audit rows. The feature log contained 239 usable rows after two warm-up observations, one at startup and one after mission elapsed time moved backward. The deployed forest used 143 rows to fit, 48 to calibrate, and 48 to evaluate. The 48 holdout scores matched the compiled C99 model. No holdout rows exceeded the threshold.
-- **Live deployment.** After rebuilding and restarting, a fresh 30-NOOP session produced 28 passes and two false alerts. The [live audit](out/ids_live_audit.csv), [timeline](out/ids_live_timeline.png), and [nominal features](out/nos3_nominal_noop_features.csv) are in the output folder. The next sequence number in the running session is 30.
-- **Offline replay.** The separate synthetic model flagged one of 250 nominal observations and six of eight timing fixtures. C99 and Python scores agreed to within `1.2e-16` on 200 held-out rows. These small runs establish the capture, training, deployment, and logging path. The alert rate on representative mission traffic remains unknown.
-
-## Offline validation and retraining
+Collect separate fit and calibration captures from known nominal traffic. Each needs at least 64 usable rows per MID. The shipped profiles let you use the detector before collecting new baselines. Send no other commands while a scripted capture is active.
 
 ```powershell
-.\.venv\Scripts\python.exe tools/demo.py
-.\.venv\Scripts\python.exe tools/analyze_audit.py out/ids_demo_audit.csv --plot out/ids_demo_timeline.png
-```
-
-This generates synthetic nominal observations and off-nominal timing fixtures, exercises the same C feature extractor, and compares compiled scores with scikit-learn. It reads and writes local files. The fixture metrics measure behavior on this demonstration dataset.
-
-For a new model, run a fresh nominal capture, export the CSVs, and save the training session under a distinct filename. The trainer requires at least 200 finite feature rows. It accepts the live feature CSV from known nominal sessions, regardless of the current model's audit flags.
-
-```powershell
-.\.venv\Scripts\python.exe tools/train.py out/ids_live_features.csv ids_app/fsw/src/ids_model.h
+docker exec nos3-ids-lab python3 /source/tools/capture_nominal.py fit --count 112 --seed 491
+docker exec nos3-ids-lab python3 /source/tools/capture_nominal.py calibration --count 76 --sequence 112 --seed 885
+.\.venv\Scripts\python.exe tools/train_profiles.py out/fit_features.csv out/calibration_features.csv ids_app/fsw/src --reference out/profile_reference.csv
 docker restart -t 1 nos3-ids-lab
 docker exec nos3-ids-lab bash /source/tools/build_lab.sh
 docker exec -d nos3-ids-lab bash -lc 'bash /source/tools/start_lab.sh >/out/nos3-supervisor.log 2>&1'
 ```
+
+After cFS reaches the operational state, capture a fresh validation session and compare the compiled scorer, scikit-learn reference, and live audit. The comparison uses the earlier model in `ids_model.h` as a baseline on Sample observations. The two deployed models come from `ids_profiles.h` and its included headers.
+
+```powershell
+docker exec nos3-ids-lab python3 /source/tools/capture_nominal.py validation --count 100 --seed 1092
+.\.venv\Scripts\python.exe tools/check_profiles.py out/profile_reference.csv out/validation_features.csv
+.\.venv\Scripts\python.exe tools/analyze_audit.py out/validation_audit.csv --nominal-features out/validation_features.csv
+```
+
 
 ## Local setup
 

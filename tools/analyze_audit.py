@@ -11,6 +11,9 @@ def summarize_nominal(parser, audit, feature_path):
     with feature_path.open(newline="", encoding="utf-8-sig") as stream:
         reader = csv.DictReader(stream)
         columns = ["seq_delta", "delta_t_ms", "packet_size", "function_code", "packets_last_second"]
+        if reader.fieldnames == ["timestamp", "message_id", *columns, "model_score", "decision"]:
+            summarize_profiles(parser, audit, list(reader))
+            return
         if reader.fieldnames != columns:
             parser.error(f"expected feature header {','.join(columns)}")
         features = list(reader)
@@ -49,6 +52,30 @@ def summarize_nominal(parser, audit, feature_path):
     print(f"Other observations excluded from model rate: {len(audit) - len(scored)}")
     for timestamp, gap, count in failures:
         print(f"  MET {timestamp} s | gap {gap} ms | {count} packets in the last second")
+
+
+def summarize_profiles(parser, audit, features):
+    expected = []
+    for row in audit:
+        note = row["note"]
+        if not note or note.startswith(("Receive rate ", "Timing outlier ", "Command contract passed.")):
+            expected.append((row["timestamp"], row["message_id"], row["status"]))
+    statuses = {"PASS": "PASS", "RATE": "FAIL", "OUTLIER": "FAIL", "UNCALIBRATED": "PASS"}
+    actual = [(row["timestamp"], row["message_id"], statuses.get(row["decision"])) for row in features]
+    if expected != actual:
+        parser.error("audit and feature decisions disagree. Export both from the same capture")
+
+    counts = Counter((row["message_id"], row["decision"]) for row in features)
+    for mid in sorted({row["message_id"] for row in audit}):
+        flagged = counts[mid, "RATE"] + counts[mid, "OUTLIER"]
+        print(f"{mid} nominal timing flags: {flagged}/{counts[mid, 'PASS'] + flagged} scored")
+        if counts[mid, "UNCALIBRATED"]:
+            print(f"  {counts[mid, 'UNCALIBRATED']} uncalibrated observations")
+        for row in features:
+            if row["message_id"] == mid and row["decision"] in {"RATE", "OUTLIER"}:
+                print(f"  MET {row['timestamp']} s | {row['decision']} | "
+                      f"gap {row['delta_t_ms']} ms | {row['packets_last_second']} packets in the last second")
+    print(f"Warm-up and command-contract failures excluded from timing rate: {len(audit) - len(features)}")
 
 
 def main():
